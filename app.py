@@ -350,7 +350,7 @@ URL_AS_NEW     = "https://docs.google.com/spreadsheets/d/1oGAGdXrhXDM6xEl7rdl4p9
 st.markdown("""
 <div class="main-header">
     <div>
-        <h1>📦 MKB 입출고 / 재고 검색</h1>
+        <h1>MKB 입출고 / 재고 검색</h1>
         <p>입고 내역 · 출고 내역 · 품절 이력 개별 / 통합 조회</p>
     </div>
 </div>

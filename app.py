@@ -394,7 +394,7 @@ URL_AS_NEW     = "https://docs.google.com/spreadsheets/d/1oGAGdXrhXDM6xEl7rdl4p9
 st.markdown("""
 <div class="main-header">
     <div>
-        <h1>📦 MKB 입출고 / 재고 검색</h1>
+        <h1>MKB 입출고 / 재고 검색</h1>
         <p>입고 내역 · 출고 내역 · 품절 이력 개별 / 통합 조회</p>
     </div>
 </div>
@@ -405,7 +405,7 @@ with st.sidebar:
     st.markdown("### ⚙️ 설정")
 
     # 전체 사전 로드 버튼
-    if st.button("📦 출고 데이터 로드 (전체)", use_container_width=True):
+    if st.button("출고 데이터 로드 (전체)", use_container_width=True):
         all_items = get_drive_file_list(FOLDER_OUTBOUND_ID)
         current_ym = date.today().year * 100 + date.today().month
         total = len(all_items)
@@ -434,7 +434,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    if st.button("⚡ 당월 출고 새로고침", use_container_width=True):
+    if st.button("당월 출고 새로고침", use_container_width=True):
         _load_single_file_current.clear()
         st.success("당월 출고 데이터 새로고침 완료!")
 
@@ -454,7 +454,7 @@ with st.sidebar:
             load_sheet(URL_OUTOFSTOCK, tab_name="QUERY연도별")
         st.success("✅ 입고·품절 로드 완료!")
 
-    if st.button("🔧 AS 시트 로드 (구/신)", use_container_width=True):
+    if st.button("AS 시트 로드 (구/신)", use_container_width=True):
         load_sheet.clear()  # 캐시 초기화 후 새로 로드
         with st.spinner("AS 구 시트 로딩 (2015~2021)..."):
             _r1 = load_sheet(URL_AS_OLD, tab_name="QUERY")

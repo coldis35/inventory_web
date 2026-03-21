@@ -191,11 +191,17 @@ def load_sheet(url, tab_name=None, tab_index=0, header_row=1):
         ws = doc.worksheet(tab_name) if tab_name else doc.get_worksheet(tab_index)
         raw = ws.get_all_values()
         if not raw or len(raw) <= header_row:
-            return pd.DataFrame()
+            empty = pd.DataFrame()
+            empty.attrs['error'] = f"데이터 없음 (탭: {tab_name})"
+            return empty
         headers = make_unique_columns(raw[header_row - 1])
-        return pd.DataFrame(raw[header_row:], columns=headers)
+        df = pd.DataFrame(raw[header_row:], columns=headers)
+        df.attrs['error'] = ''
+        return df
     except Exception as e:
-        return pd.DataFrame()  # 에러는 호출부에서 처리
+        empty = pd.DataFrame()
+        empty.attrs['error'] = str(e)
+        return empty
 
 @st.cache_data(ttl=86400)  # 24시간 캐시
 def get_drive_file_list(folder_id):
@@ -236,17 +242,55 @@ def parse_yyyymm(name):
 SKIP_TABS = ['피벗', '피봇', 'pivot', 'Pivot', '요약', '집계', 'Summary']
 
 def _read_first_data_tab(doc, file_name):
-    """파일에서 첫 번째 데이터 탭만 읽어 반환 (중복 방지)"""
+    """파일에서 첫 번째 데이터 탭을 읽고 표준 컬럼으로 반환 (중복 방지)"""
     for ws in doc.worksheets():
         if any(s in ws.title for s in SKIP_TABS):
             continue
         try:
             data = ws.get_all_values()
             if data and len(data) > 1:
-                headers = make_unique_columns(data[0])
+                raw_headers = [str(h).strip() for h in data[0]]
+                headers = make_unique_columns(raw_headers)
                 df = pd.DataFrame(data[1:], columns=headers)
-                df['_출처'] = file_name
-                return df   # 첫 번째 데이터 탭만 반환
+
+                # ── 표준 컬럼 감지 ──
+                # 날짜: "일시" > "날짜" > 첫 번째 컬럼
+                date_c = next((c for c in headers if c in ('일시', '날짜')), None)
+                if not date_c:
+                    date_c = next((c for c in headers if '일시' in c or '날짜' in c or 'date' in c.lower()), None)
+                if not date_c and headers:
+                    date_c = headers[0]
+
+                # 인덱스/코드: "코드" > "인덱스"
+                idx_c = next((c for c in headers if c in ('코드', '인덱스')), None)
+                if not idx_c:
+                    idx_c = next((c for c in headers if '코드' in c or '인덱스' in c), None)
+
+                # 제품명: "제품명" > "상품명" > "상품"
+                name_c = next((c for c in headers if c in ('제품명', '상품명', '상품')), None)
+                if not name_c:
+                    name_c = next((c for c in headers if '제품' in c or '상품' in c or '품명' in c), None)
+
+                # 출고량: "출고량" > "수량"
+                qty_c = next((c for c in headers if c in ('출고량', '수량')), None)
+                if not qty_c:
+                    qty_c = next((c for c in headers if '출고' in c or '수량' in c), None)
+
+                # 판매처
+                seller_c = next((c for c in headers if '판매처' in c or '판매' in c), None)
+
+                # ── 표준 컬럼만 추출해서 통일된 DataFrame 반환 ──
+                std = pd.DataFrame()
+                std['날짜']   = df[date_c]  if date_c  else pd.NA
+                std['코드']   = df[idx_c]   if idx_c   else pd.NA
+                std['제품명'] = df[name_c]  if name_c  else pd.NA
+                std['출고량'] = df[qty_c]   if qty_c   else pd.NA
+                std['판매처'] = df[seller_c] if seller_c else pd.NA
+                std['_출처']  = file_name
+                # 빈 행 제거
+                std = std[std['날짜'].astype(str).str.strip() != '']
+                std = std[std['제품명'].astype(str).str.strip().str.len() > 0]
+                return std
         except Exception:
             pass
     return pd.DataFrame()
@@ -350,7 +394,7 @@ URL_AS_NEW     = "https://docs.google.com/spreadsheets/d/1oGAGdXrhXDM6xEl7rdl4p9
 st.markdown("""
 <div class="main-header">
     <div>
-        <h1>MKB 입출고 / 재고 검색</h1>
+        <h1>📦 MKB 입출고 / 재고 검색</h1>
         <p>입고 내역 · 출고 내역 · 품절 이력 개별 / 통합 조회</p>
     </div>
 </div>
@@ -361,7 +405,7 @@ with st.sidebar:
     st.markdown("### ⚙️ 설정")
 
     # 전체 사전 로드 버튼
-    if st.button("📦 출고 데이터 전체 로드\n(오전 1회 실행 권장)", use_container_width=True):
+    if st.button("📦 출고 데이터 로드 (전체)", use_container_width=True):
         all_items = get_drive_file_list(FOLDER_OUTBOUND_ID)
         current_ym = date.today().year * 100 + date.today().month
         total = len(all_items)
@@ -403,16 +447,29 @@ with st.sidebar:
         load_sheet.clear()
         st.success("입고·품절·AS 데이터 새로고침 완료!")
 
-    if st.button("📦 입고/품절/AS 사전 로드", use_container_width=True):
+    if st.button("📥 입고 / 품절 로드", use_container_width=True):
         with st.spinner("입고 시트 로딩..."):
             load_sheet(URL_INBOUND, tab_name="DB 컨테이너 입고리스트", header_row=3)
         with st.spinner("품절 시트 로딩..."):
             load_sheet(URL_OUTOFSTOCK, tab_name="QUERY연도별")
-        with st.spinner("AS 구 시트 로딩..."):
-            load_sheet(URL_AS_OLD, tab_name="QUERY")
-        with st.spinner("AS 신 시트 로딩..."):
-            load_sheet(URL_AS_NEW, tab_name="QUERY")
-        st.success("✅ 입고·품절·AS 로드 완료!")
+        st.success("✅ 입고·품절 로드 완료!")
+
+    if st.button("🔧 AS 시트 로드 (구/신)", use_container_width=True):
+        load_sheet.clear()  # 캐시 초기화 후 새로 로드
+        with st.spinner("AS 구 시트 로딩 (2015~2021)..."):
+            _r1 = load_sheet(URL_AS_OLD, tab_name="QUERY")
+        e1 = _r1.attrs.get('error','')
+        if e1:
+            st.error(f"AS 구 실패: {e1}")
+        else:
+            st.success(f"✅ AS 구 로드 완료! ({len(_r1):,}행)")
+        with st.spinner("AS 신 시트 로딩 (2021~)..."):
+            _r2 = load_sheet(URL_AS_NEW, tab_name="QUERY")
+        e2 = _r2.attrs.get('error','')
+        if e2:
+            st.error(f"AS 신 실패: {e2}")
+        else:
+            st.success(f"✅ AS 신 로드 완료! ({len(_r2):,}행)")
 
     st.markdown("---")
     st.caption("📌 캐시 정책")
@@ -457,27 +514,44 @@ with col_ed:
 
 st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
 
-bc1, bc2, bc3 = st.columns([2.2, 1.4, 1.4])
-with bc1:
-    btn_all      = st.button("🔍  통합 조회  (입고 + 출고 전체 + 기간별 + AS + 품절)", use_container_width=True, key="btn_all")
-with bc2:
-    btn_inbound  = st.button("📥  입고 내역 조회", use_container_width=True, key="btn_inbound")
-with bc3:
-    btn_total_ob = st.button("📊  전체 출고량 조회", use_container_width=True, key="btn_total_ob")
+# ── 개별 조회 버튼 (1~5번) ──
+bb1, bb2, bb3, bb4, bb5 = st.columns(5)
+with bb1:
+    btn_inbound  = st.button("① 📥 입고 내역", use_container_width=True, key="btn_inbound")
+with bb2:
+    btn_total_ob = st.button("② 📊 전체 출고량", use_container_width=True, key="btn_total_ob")
+with bb3:
+    btn_outbound = st.button("③ 📤 기간별 출고", use_container_width=True, key="btn_outbound")
+with bb4:
+    btn_as       = st.button("④ 🔧 AS 건수", use_container_width=True, key="btn_as")
+with bb5:
+    btn_oos      = st.button("⑤ 🔴 품절 이력", use_container_width=True, key="btn_oos")
 
-bc4, bc5, bc6 = st.columns([1.4, 1.4, 1.4])
-with bc4:
-    btn_outbound = st.button("📤  기간별 출고 조회", use_container_width=True, key="btn_outbound")
-with bc5:
-    btn_as       = st.button("🔧  AS 건수 조회", use_container_width=True, key="btn_as")
-with bc6:
-    btn_oos      = st.button("🔴  품절 이력 조회", use_container_width=True, key="btn_oos")
+# ── 통합 조회 버튼 (6번) ──
+btn_all = st.button("⑥ 🔍  통합 조회  [ 입고 + 출고 (전체/기간) + AS + 품절 ]",
+                     use_container_width=True, key="btn_all")
 
 st.markdown('</div>', unsafe_allow_html=True)
 
 # ==========================================
 # 8. 실행 판단 + DB인덱스 자동 연동
 # ==========================================
+
+# summary_data 항상 먼저 초기화 (어떤 버튼을 눌러도 안전)
+if 'summary_data' not in st.session_state:
+    st.session_state['summary_data'] = {}
+_sd_defaults = {
+    'ready': False, 'inbound_total': 0, 'ob_total': 0,
+    'as_old_total': 0, 'as_new_total': 0,
+    'as_after_oos_old': 0, 'as_after_oos_new': 0,
+    'last_oos_date': None, 'last_restock_date': None,
+    'inbound_after_restock': 0, 'outbound_after_restock': 0,
+    'cutoff_for_inbound': None,
+}
+for _k, _v in _sd_defaults.items():
+    if _k not in st.session_state['summary_data']:
+        st.session_state['summary_data'][_k] = _v
+
 do_inbound   = btn_all or btn_inbound
 do_total_ob  = btn_all or btn_total_ob
 do_outbound  = btn_outbound or btn_all
@@ -724,11 +798,11 @@ if do_outbound:
             st.markdown('<div class="warn-box">⚠️ 출고 데이터를 불러오지 못했습니다.</div>', unsafe_allow_html=True)
         else:
             cols = df_ob.columns.tolist()
-            ob_date_col = find_col(cols, exact=['일시', '날짜'], contains=['일시', '날짜', 'date'])
-            ob_idx_col  = find_col(cols, exact=['인덱스', '코드'], contains=['인덱스', '코드'])
-            ob_name_col = find_col(cols, exact=['제품명', '상품명', '상품'],
-                                   contains=['제품명', '상품명', '상품'])
-            ob_qty_col  = find_col(cols, exact='출고량', contains=['출고량', '출고', '수량'])
+            # 표준화된 컬럼명으로 고정 (파일 로드 시 이미 통일됨)
+            ob_date_col = '날짜'   if '날짜'   in cols else None
+            ob_idx_col  = '코드'   if '코드'   in cols else None
+            ob_name_col = '제품명' if '제품명' in cols else None
+            ob_qty_col  = '출고량' if '출고량' in cols else None
 
             # 날짜 필터
             if ob_date_col:
@@ -773,9 +847,14 @@ if do_as:
         f'{start_date.strftime("%Y.%m.%d")} ~ {end_date.strftime("%Y.%m.%d")}</span></div>',
         unsafe_allow_html=True)
 
-    with st.spinner("🔧 AS 데이터 로딩 중..."):
-        df_as_old = load_sheet(URL_AS_OLD, tab_name="QUERY")   # E=상품명, B=날짜, A,C,F
-        df_as_new = load_sheet(URL_AS_NEW, tab_name="QUERY")   # C=인덱스, B=날짜, A,E,F,G
+    with st.spinner("🔧 AS 구 시트 로딩 중 (2015~2021)..."):
+        df_as_old = load_sheet(URL_AS_OLD, tab_name="QUERY")
+    if df_as_old.attrs.get('error'):
+        st.warning(f"AS 구 로드 실패: {df_as_old.attrs['error']}")
+    with st.spinner("🔧 AS 신 시트 로딩 중 (2021~)..."):
+        df_as_new = load_sheet(URL_AS_NEW, tab_name="QUERY")
+    if df_as_new.attrs.get('error'):
+        st.warning(f"AS 신 로드 실패: {df_as_new.attrs['error']}")
 
     # ── AS 구 (2015~2021.03.30): E열=상품명, 인덱스없음 ──
     as_old_total, as_old_period = 0, 0
@@ -1148,19 +1227,7 @@ if do_oos:
 # 복붙용 요약 (입고+전체출고+AS+품절 모두 조회된 경우)
 # ==========================================
 # 각 섹션 결과를 session_state에 저장해서 요약에 활용
-if 'summary_data' not in st.session_state:
-    st.session_state['summary_data'] = {}
-# 항상 기본값 보장
-_sd_defaults = {
-    'ready': False, 'inbound_total': 0, 'ob_total': 0,
-    'as_old_total': 0, 'as_new_total': 0,
-    'as_after_oos_old': 0, 'as_after_oos_new': 0,
-    'last_oos_date': None, 'last_restock_date': None,
-    'inbound_after_restock': 0, 'outbound_after_restock': 0,
-}
-for _k, _v in _sd_defaults.items():
-    if _k not in st.session_state['summary_data']:
-        st.session_state['summary_data'][_k] = _v
+# (summary_data 초기화는 위에서 처리됨)
 
 # 요약 출력 조건: 입고 + 전체출고 + AS 가 모두 조회된 경우
 sd = st.session_state.get('summary_data', {})

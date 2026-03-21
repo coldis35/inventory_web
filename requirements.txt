@@ -1,0 +1,7 @@
+streamlit
+pandas
+gspread
+google-auth
+xlsxwriter
+openpyxl
+google-api-python-client

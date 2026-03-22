@@ -183,13 +183,17 @@ def find_col(cols, exact=None, contains=None, fallback_idx=None):
 # 4. 데이터 로드 함수
 # ==========================================
 @st.cache_data(ttl=86400)  # 24시간 캐시
-def load_sheet(url, tab_name=None, tab_index=0, header_row=1):
+def load_sheet(url, tab_name=None, tab_index=0, header_row=1, col_range=None):
+    """col_range: 'A:G' 처럼 컬럼 범위 지정 가능 (대용량 시트 로드 속도 개선)"""
     try:
         creds = get_credentials()
         gc = gspread.authorize(creds)
         doc = gc.open_by_url(url)
         ws = doc.worksheet(tab_name) if tab_name else doc.get_worksheet(tab_index)
-        raw = ws.get_all_values()
+        if col_range:
+            raw = ws.get(col_range)
+        else:
+            raw = ws.get_all_values()
         if not raw or len(raw) <= header_row:
             empty = pd.DataFrame()
             empty.attrs['error'] = f"데이터 없음 (탭: {tab_name})"
@@ -394,7 +398,7 @@ URL_AS_NEW     = "https://docs.google.com/spreadsheets/d/1oGAGdXrhXDM6xEl7rdl4p9
 st.markdown("""
 <div class="main-header">
     <div>
-        <h1>MKB 입출고 / 재고 검색</h1>
+        <h1>📦 MKB 입출고 / 재고 검색</h1>
         <p>입고 내역 · 출고 내역 · 품절 이력 개별 / 통합 조회</p>
     </div>
 </div>
@@ -405,7 +409,7 @@ with st.sidebar:
     st.markdown("### ⚙️ 설정")
 
     # 전체 사전 로드 버튼
-    if st.button("출고 데이터 로드 (전체)", use_container_width=True):
+    if st.button("📦 출고 데이터 로드 (전체)", use_container_width=True):
         all_items = get_drive_file_list(FOLDER_OUTBOUND_ID)
         current_ym = date.today().year * 100 + date.today().month
         total = len(all_items)
@@ -434,7 +438,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    if st.button("당월 출고 새로고침", use_container_width=True):
+    if st.button("⚡ 당월 출고 새로고침", use_container_width=True):
         _load_single_file_current.clear()
         st.success("당월 출고 데이터 새로고침 완료!")
 
@@ -454,7 +458,7 @@ with st.sidebar:
             load_sheet(URL_OUTOFSTOCK, tab_name="QUERY연도별")
         st.success("✅ 입고·품절 로드 완료!")
 
-    if st.button("AS 시트 로드 (구/신)", use_container_width=True):
+    if st.button("🔧 AS 시트 로드 (구/신)", use_container_width=True):
         load_sheet.clear()  # 캐시 초기화 후 새로 로드
         with st.spinner("AS 구 시트 로딩 (2015~2021)..."):
             _r1 = load_sheet(URL_AS_OLD, tab_name="QUERY")
@@ -464,7 +468,7 @@ with st.sidebar:
         else:
             st.success(f"✅ AS 구 로드 완료! ({len(_r1):,}행)")
         with st.spinner("AS 신 시트 로딩 (2021~)..."):
-            _r2 = load_sheet(URL_AS_NEW, tab_name="QUERY")
+            _r2 = load_sheet(URL_AS_NEW, tab_name="QUERY", col_range="A:G")
         e2 = _r2.attrs.get('error','')
         if e2:
             st.error(f"AS 신 실패: {e2}")
@@ -852,7 +856,7 @@ if do_as:
     if df_as_old.attrs.get('error'):
         st.warning(f"AS 구 로드 실패: {df_as_old.attrs['error']}")
     with st.spinner("🔧 AS 신 시트 로딩 중 (2021~)..."):
-        df_as_new = load_sheet(URL_AS_NEW, tab_name="QUERY")
+        df_as_new = load_sheet(URL_AS_NEW, tab_name="QUERY", col_range="A:G")
     if df_as_new.attrs.get('error'):
         st.warning(f"AS 신 로드 실패: {df_as_new.attrs['error']}")
 
@@ -1005,20 +1009,30 @@ if do_as:
                 if ib_qty_c:
                     ib_after_restock = df_ib_after[ib_qty_c].apply(safe_int).sum()
 
-        # 출고 데이터에서 계산 (전체출고량 시트 활용)
-        df_tob_sum = load_sheet(URL_TOTAL_OB, tab_index=0, header_row=2)
-        if not df_tob_sum.empty:
-            t_cols = df_tob_sum.columns.tolist()
-            t_idx  = t_cols[1] if len(t_cols) > 1 else None
-            t_name = t_cols[2] if len(t_cols) > 2 else None
-            # 연도별 합계를 cutoff 연도 기준으로 합산 (근사값)
-            year_map2 = {t_cols[4+i]: 2026-i for i in range(9) if 4+i < len(t_cols)}
-            df_t_hit = exact_match(df_tob_sum, t_name, t_idx)
-            if not df_t_hit.empty and (cutoff_for_inbound or cutoff_for_summary):
-                cutoff_year = (cutoff_for_inbound or cutoff_for_summary).year
-                for col, yr in year_map2.items():
-                    if yr >= cutoff_year:
-                        ob_after_restock += df_t_hit[col].apply(safe_int).sum()
+        # 출고 데이터에서 계산 (드라이브 파일 - 일자별 정확한 계산)
+        _ob_cutoff = cutoff_for_inbound or cutoff_for_summary
+        if _ob_cutoff:
+            # cutoff 날짜부터 오늘까지 기간의 파일 로드
+            _start_ym = _ob_cutoff.year * 100 + _ob_cutoff.month
+            _end_ym   = date.today().year * 100 + date.today().month
+            df_ob_after_raw = load_outbound_for_period(FOLDER_OUTBOUND_ID, _start_ym, _end_ym)
+            if not df_ob_after_raw.empty:
+                # 표준 컬럼 '날짜', '코드', '제품명', '출고량' 사용
+                _date_c = '날짜'   if '날짜'   in df_ob_after_raw.columns else None
+                _name_c = '제품명' if '제품명' in df_ob_after_raw.columns else None
+                _idx_c  = '코드'   if '코드'   in df_ob_after_raw.columns else None
+                _qty_c  = '출고량' if '출고량' in df_ob_after_raw.columns else None
+                # 날짜 필터 (cutoff 당일 포함)
+                if _date_c:
+                    df_ob_after_raw['_d2'] = df_ob_after_raw[_date_c].apply(to_date)
+                    df_ob_after_raw = df_ob_after_raw[
+                        df_ob_after_raw['_d2'].notna() &
+                        (df_ob_after_raw['_d2'] >= _ob_cutoff)
+                    ]
+                # 상품 검색
+                df_ob_after_hit = exact_match(df_ob_after_raw, _name_c, _idx_c)
+                if _qty_c and not df_ob_after_hit.empty:
+                    ob_after_restock = df_ob_after_hit[_qty_c].apply(safe_int).sum()
 
     # 요약용 데이터 저장
     if 'summary_data' not in st.session_state:

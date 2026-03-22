@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import gspread
 import pandas as pd
 import streamlit as st
@@ -11,7 +12,27 @@ from googleapiclient.discovery import build
 # ==========================================
 # 1. 페이지 설정
 # ==========================================
-st.set_page_config(page_title="MKB 입출고 / 재고 검색", page_icon="📦", layout="wide")
+st.set_page_config(page_title="MKB 입출고 / 재고 검색", page_icon=None, layout="wide")
+
+# ==========================================
+# 로그인 세션 확인 (직원 전용 보안)
+# ==========================================
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if not st.session_state.logged_in:
+    st.markdown("<br><br><br>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        st.info("📦 MKB 직원 전용 시스템입니다.")
+        pwd = st.text_input("접속 비밀번호를 입력하세요", type="password")
+        if st.button("로그인", use_container_width=True):
+            if pwd == "mkb1234":  # 🔑 원하는 비밀번호로 여기서 변경하세요!
+                st.session_state.logged_in = True
+                st.rerun()
+            else:
+                st.error("비밀번호가 일치하지 않습니다.")
+    st.stop() # 로그인 전에는 아래 화면이 보이지 않음
 
 st.markdown("""
 <style>
@@ -104,7 +125,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 구글 인증
+# 2. 구글 인증 (비밀 금고 연동 방식으로 변경됨)
 # ==========================================
 @st.cache_resource
 def get_credentials():
@@ -112,20 +133,30 @@ def get_credentials():
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive'
     ]
+    
+    # 1. Hugging Face 비밀금고(Secrets)에서 키 가져오기
+    hf_key = os.environ.get("GCP_KEY")
+    if hf_key:
+        try:
+            creds_info = json.loads(hf_key)
+            return Credentials.from_service_account_info(creds_info, scopes=scopes)
+        except Exception as e:
+            st.error(f"비밀금고 키 해독 오류: {e}")
+            st.stop()
+            
+    # 2. 로컬 테스트용 (기존 secrets.json 파일)
     for path in [
         'secrets.json',
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'secrets.json')
     ]:
-        try:
-            return Credentials.from_service_account_file(path, scopes=scopes)
-        except Exception:
-            pass
-    try:
-        return Credentials.from_service_account_info(
-            dict(st.secrets["gcp_service_account"]), scopes=scopes)
-    except Exception:
-        st.error("secrets.json 또는 웹 금고 설정을 확인하세요.")
-        st.stop()
+        if os.path.exists(path):
+            try:
+                return Credentials.from_service_account_file(path, scopes=scopes)
+            except Exception:
+                pass
+    
+    st.error("구글 인증 키(GCP_KEY)를 찾을 수 없습니다. Hugging Face Settings를 확인하세요.")
+    st.stop()
 
 # ==========================================
 # 3. 공통 유틸
@@ -184,28 +215,37 @@ def find_col(cols, exact=None, contains=None, fallback_idx=None):
 # ==========================================
 @st.cache_data(ttl=86400)  # 24시간 캐시
 def load_sheet(url, tab_name=None, tab_index=0, header_row=1, col_range=None):
-    """col_range: 'A:G' 처럼 컬럼 범위 지정 가능 (대용량 시트 로드 속도 개선)"""
-    try:
-        creds = get_credentials()
-        gc = gspread.authorize(creds)
-        doc = gc.open_by_url(url)
-        ws = doc.worksheet(tab_name) if tab_name else doc.get_worksheet(tab_index)
-        if col_range:
-            raw = ws.get(col_range)
-        else:
-            raw = ws.get_all_values()
-        if not raw or len(raw) <= header_row:
-            empty = pd.DataFrame()
-            empty.attrs['error'] = f"데이터 없음 (탭: {tab_name})"
-            return empty
-        headers = make_unique_columns(raw[header_row - 1])
-        df = pd.DataFrame(raw[header_row:], columns=headers)
-        df.attrs['error'] = ''
-        return df
-    except Exception as e:
-        empty = pd.DataFrame()
-        empty.attrs['error'] = str(e)
-        return empty
+    """col_range: 'A:G' 처럼 컬럼 범위 지정. 503 오류 시 지수 백오프 재시도."""
+    last_err = ""
+    for attempt in range(5):  # 최대 5회 재시도
+        try:
+            if attempt > 0:
+                wait = 2 ** attempt  # 2, 4, 8, 16초
+                time.sleep(wait)
+            creds = get_credentials()
+            gc = gspread.authorize(creds)
+            doc = gc.open_by_url(url)
+            ws = doc.worksheet(tab_name) if tab_name else doc.get_worksheet(tab_index)
+            if col_range:
+                raw = ws.get_values(col_range)  # get_values가 더 안정적
+            else:
+                raw = ws.get_all_values()
+            if not raw or len(raw) <= header_row:
+                empty = pd.DataFrame()
+                empty.attrs['error'] = f"데이터 없음 (탭: {tab_name})"
+                return empty
+            headers = make_unique_columns(raw[header_row - 1])
+            df = pd.DataFrame(raw[header_row:], columns=headers)
+            df.attrs['error'] = ''
+            return df
+        except Exception as e:
+            last_err = str(e)
+            # 503/429 오류가 아니면 재시도 무의미
+            if '503' not in last_err and '429' not in last_err and '500' not in last_err:
+                break
+    empty = pd.DataFrame()
+    empty.attrs['error'] = last_err
+    return empty
 
 @st.cache_data(ttl=86400)  # 24시간 캐시
 def get_drive_file_list(folder_id):
@@ -310,7 +350,7 @@ def _load_single_file(file_id, file_name):
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=3600)    # 당월 파일: 1시간 캐시
+@st.cache_data(ttl=86400)   # 당월 파일: 24시간 캐시
 def _load_single_file_current(file_id, file_name):
     """당월 파일 전용 (1시간마다 갱신)"""
     try:
@@ -390,7 +430,7 @@ URL_TOTAL_OB   = "https://docs.google.com/spreadsheets/d/1fyeuHQx_mkYIH7ZtK54FLz
 URL_OUTOFSTOCK = "https://docs.google.com/spreadsheets/d/1mACjH0gb6NYYPHviMAOBuS4JgT6bh4T-2z7-cbP4VjQ/edit"
 FOLDER_OUTBOUND_ID = "16qj3-iKIUg9UcKknLkObXU8EvSnFqmnP"
 URL_AS_OLD     = "https://docs.google.com/spreadsheets/d/13cltUKY6ihRJmwapwG_7SodQ8SBCIELY7h7XgEDeFRU/edit"  # 2015~2021.03.30 QUERY탭 E=상품명
-URL_AS_NEW     = "https://docs.google.com/spreadsheets/d/1oGAGdXrhXDM6xEl7rdl4p9a6tH0uItqCf2zqQI-yJ2w/edit"  # 2021.01.01~ QUERY탭 C=인덱스
+URL_AS_NEW     = "https://docs.google.com/spreadsheets/d/1qjrIRJOUe_Abh1UOnCOxhgcvU8jAZrOx9hq7GJzFqlM/edit"  # 2021.01.01~ QUERY_Copy탭 A2:G, C=인덱스
 
 # ==========================================
 # 6. 헤더 UI
@@ -398,18 +438,27 @@ URL_AS_NEW     = "https://docs.google.com/spreadsheets/d/1oGAGdXrhXDM6xEl7rdl4p9
 st.markdown("""
 <div class="main-header">
     <div>
-        <h1>📦 MKB 입출고 / 재고 검색</h1>
+        <h1>MKB 입출고 / 재고 검색</h1>
         <p>입고 내역 · 출고 내역 · 품절 이력 개별 / 통합 조회</p>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-# 사이드바: 캐시 초기화
+# 사이드바
 with st.sidebar:
-    st.markdown("### ⚙️ 설정")
+    st.markdown("### 설정")
 
-    # 전체 사전 로드 버튼
-    if st.button("📦 출고 데이터 로드 (전체)", use_container_width=True):
+    # ── 업데이트 시각 session_state 초기화 ──
+    for _k in ['ts_outbound', 'ts_inbound_oos', 'ts_as', 'ts_as_old', 'ts_as_new']:
+        if _k not in st.session_state:
+            st.session_state[_k] = None
+
+    def _ts():
+        return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # ── 출고 데이터 로드 ──
+    st.markdown("**출고 데이터**")
+    if st.button("출고 데이터 업데이트 (전체)", use_container_width=True):
         all_items = get_drive_file_list(FOLDER_OUTBOUND_ID)
         current_ym = date.today().year * 100 + date.today().month
         total = len(all_items)
@@ -427,59 +476,111 @@ with st.sidebar:
             except Exception:
                 fail_count += 1
             import time as _t
-            _t.sleep(0.5)   # API 쿼터 보호
-            prog.progress((i + 1) / total,
-                          text=f"{i+1} / {total} — {item['name']}")
+            _t.sleep(0.5)
+            prog.progress((i + 1) / total, text=f"{i+1} / {total} — {item['name']}")
         prog.empty()
+        st.session_state['ts_outbound'] = _ts()
         if fail_count:
             st.warning(f"완료: {ok_count}개 성공, {fail_count}개 실패")
         else:
-            st.success(f"✅ {ok_count}개 파일 모두 로드 완료! 이제 검색이 빠릅니다.")
+            st.success(f"{ok_count}개 파일 로드 완료")
 
-    st.markdown("---")
-
-    if st.button("⚡ 당월 출고 새로고침", use_container_width=True):
+    if st.button("당월 출고 업데이트", use_container_width=True):
         _load_single_file_current.clear()
-        st.success("당월 출고 데이터 새로고침 완료!")
+        st.session_state['ts_outbound'] = _ts()
+        st.success("당월 출고 새로고침 완료")
 
-    if st.button("🔄 전체 캐시 초기화", use_container_width=True):
-        st.cache_data.clear()
-        st.success("캐시 초기화 완료!")
+    if st.session_state['ts_outbound']:
+        st.caption(f"최근 업데이트: {st.session_state['ts_outbound']}")
+
+    if st.button("출고 캐시 초기화", use_container_width=True):
+        _load_single_file.clear()
+        _load_single_file_current.clear()
+        get_drive_file_list.clear()
+        st.session_state['ts_outbound'] = None
+        st.success("출고 캐시 초기화 완료")
 
     st.markdown("---")
-    if st.button("📥 입고/품절/AS 새로고침", use_container_width=True):
-        load_sheet.clear()
-        st.success("입고·품절·AS 데이터 새로고침 완료!")
 
-    if st.button("📥 입고 / 품절 로드", use_container_width=True):
+    # ── 입고/품절 로드 ──
+    st.markdown("**입고 / 품절**")
+    if st.button("입고 / 품절 업데이트", use_container_width=True):
         with st.spinner("입고 시트 로딩..."):
             load_sheet(URL_INBOUND, tab_name="DB 컨테이너 입고리스트", header_row=3)
         with st.spinner("품절 시트 로딩..."):
             load_sheet(URL_OUTOFSTOCK, tab_name="QUERY연도별")
-        st.success("✅ 입고·품절 로드 완료!")
+        st.session_state['ts_inbound_oos'] = _ts()
+        st.success("입고·품절 로드 완료")
 
-    if st.button("🔧 AS 시트 로드 (구/신)", use_container_width=True):
-        load_sheet.clear()  # 캐시 초기화 후 새로 로드
-        with st.spinner("AS 구 시트 로딩 (2015~2021)..."):
-            _r1 = load_sheet(URL_AS_OLD, tab_name="QUERY")
-        e1 = _r1.attrs.get('error','')
-        if e1:
-            st.error(f"AS 구 실패: {e1}")
-        else:
-            st.success(f"✅ AS 구 로드 완료! ({len(_r1):,}행)")
-        with st.spinner("AS 신 시트 로딩 (2021~)..."):
-            _r2 = load_sheet(URL_AS_NEW, tab_name="QUERY", col_range="A:G")
-        e2 = _r2.attrs.get('error','')
-        if e2:
-            st.error(f"AS 신 실패: {e2}")
-        else:
-            st.success(f"✅ AS 신 로드 완료! ({len(_r2):,}행)")
+    if st.session_state['ts_inbound_oos']:
+        st.caption(f"최근 업데이트: {st.session_state['ts_inbound_oos']}")
+
+    if st.button("입고/품절 캐시 초기화", use_container_width=True):
+        # load_sheet 전체 초기화는 AS도 같이 지워지므로 주의
+        load_sheet.clear()
+        st.session_state['ts_inbound_oos'] = None
+        st.session_state['ts_as'] = None
+        st.success("입고/품절/AS 캐시 초기화 완료")
 
     st.markdown("---")
-    st.caption("📌 캐시 정책")
-    st.caption("• 과거 출고 데이터: **7일** 유지")
-    st.caption("• 당월 출고 데이터: **1시간** 유지")
-    st.caption("• 입고/품절/AS 시트: **24시간** 유지")
+
+    # ── AS 시트 (구분) ──
+    st.markdown("**AS Report (2015~2021.03.30)**")
+    if st.button("AS 구 업데이트", use_container_width=True):
+        # AS 구 캐시만 선택적으로 초기화 후 재로드
+        @st.cache_data(ttl=86400)
+        def _load_as_old_fresh():
+            return load_sheet.__wrapped__(URL_AS_OLD, "QUERY", 0, 1, None)
+        with st.spinner("AS 구 로딩 (2015~2021)..."):
+            _r1 = load_sheet(URL_AS_OLD, tab_name="QUERY")
+        e1 = _r1.attrs.get('error', '')
+        if e1:
+            st.error(f"실패: {e1}")
+        else:
+            st.session_state['ts_as_old'] = _ts()
+            st.success(f"완료 ({len(_r1):,}행)")
+
+    if st.button("AS 구 캐시 초기화", use_container_width=True):
+        st.session_state['ts_as_old'] = None
+        st.success("AS 구 캐시 초기화 완료 (다음 업데이트 시 새로 로드됩니다)")
+
+    if st.session_state.get('ts_as_old'):
+        st.caption(f"최근 업데이트: {st.session_state['ts_as_old']}")
+
+    st.markdown("**AS Report (2021.01.01~)**")
+    # AS 신 503 오류 대응: 재시도 로직 포함
+    if st.button("AS 신 업데이트", use_container_width=True):
+        with st.spinner("AS 신 로딩 중... (최대 5회 자동 재시도)"):
+            _r2 = load_sheet(URL_AS_NEW, tab_name="QUERY_Copy", col_range="A:G")
+        e2 = _r2.attrs.get('error', '')
+        if e2:
+            st.error(f"실패: {e2}")
+        else:
+            st.session_state['ts_as_new'] = _ts()
+            st.success(f"완료 ({len(_r2):,}행)")
+
+    if st.button("AS 신 캐시 초기화", use_container_width=True):
+        st.session_state['ts_as_new'] = None
+        st.success("AS 신 캐시 초기화 완료")
+
+    if st.session_state.get('ts_as_new'):
+        st.caption(f"최근 업데이트: {st.session_state['ts_as_new']}")
+
+    st.markdown("---")
+
+    # ── 전체 캐시 초기화 ──
+    if st.button("전체 캐시 초기화", use_container_width=True):
+        st.cache_data.clear()
+        st.session_state['ts_outbound'] = None
+        st.session_state['ts_inbound_oos'] = None
+        st.session_state['ts_as'] = None
+        st.success("전체 캐시 초기화 완료")
+
+    st.markdown("---")
+    st.caption("캐시 정책")
+    st.caption("• 과거 출고: 7일 유지")
+    st.caption("• 당월 출고: 1시간 유지")
+    st.caption("• 입고/품절/AS: 24시간 유지")
 
 # ==========================================
 # 7. 검색 입력 폼
@@ -489,19 +590,19 @@ st.markdown('<div class="search-box">', unsafe_allow_html=True)
 col_nm, col_idx, col_sd, col_ed = st.columns([2.5, 1.5, 1.2, 1.2])
 with col_nm:
     search_name = st.text_input(
-        "🔍 상품명 검색",
+        "상품명 검색",
         placeholder="예: SIMPLIE 수납장 BC264 화이트",
         key="search_name"
     )
 with col_idx:
     search_idx = st.text_input(
-        "🔢 인덱스 번호 검색",
+        "인덱스 번호 검색",
         placeholder="예: 7313.2106",
         key="search_idx"
     )
 with col_sd:
     start_date = st.date_input(
-        "📅 조회 시작일",
+        "조회 시작일",
         value=date(2018, 5, 9),
         min_value=date(2018, 5, 9),
         max_value=date.today(),
@@ -509,7 +610,7 @@ with col_sd:
     )
 with col_ed:
     end_date = st.date_input(
-        "📅 조회 종료일",
+        "조회 종료일",
         value=date.today(),
         min_value=date(2018, 5, 9),
         max_value=date.today(),
@@ -521,19 +622,24 @@ st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
 # ── 개별 조회 버튼 (1~5번) ──
 bb1, bb2, bb3, bb4, bb5 = st.columns(5)
 with bb1:
-    btn_inbound  = st.button("① 📥 입고 내역", use_container_width=True, key="btn_inbound")
+    btn_inbound  = st.button("① 입고 내역", use_container_width=True, key="btn_inbound")
 with bb2:
-    btn_total_ob = st.button("② 📊 전체 출고량", use_container_width=True, key="btn_total_ob")
+    btn_total_ob = st.button("② 전체 출고량", use_container_width=True, key="btn_total_ob")
 with bb3:
-    btn_outbound = st.button("③ 📤 기간별 출고", use_container_width=True, key="btn_outbound")
+    btn_outbound = st.button("③ 기간별 출고", use_container_width=True, key="btn_outbound")
 with bb4:
-    btn_as       = st.button("④ 🔧 AS 건수", use_container_width=True, key="btn_as")
+    btn_as       = st.button("④ AS 건수", use_container_width=True, key="btn_as")
 with bb5:
-    btn_oos      = st.button("⑤ 🔴 품절 이력", use_container_width=True, key="btn_oos")
+    btn_oos      = st.button("⑤ 품절 이력", use_container_width=True, key="btn_oos")
 
 # ── 통합 조회 버튼 (6번) ──
-btn_all = st.button("⑥ 🔍  통합 조회  [ 입고 + 출고 (전체/기간) + AS + 품절 ]",
+btn_all = st.button("⑥ 통합 조회 [ 입고 + 출고 (전체/기간) + AS + 품절 ]",
                      use_container_width=True, key="btn_all")
+
+# ── 잔여재고 조회 버튼 (7번) ──
+btn_stock = st.button("⑦ 잔여재고 조회  [ 입고 + 전체출고 + AS + 품절이력 → 요약 + 복붙 ]",
+                       use_container_width=True, key="btn_stock",
+                       type="primary")
 
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -541,7 +647,14 @@ st.markdown('</div>', unsafe_allow_html=True)
 # 8. 실행 판단 + DB인덱스 자동 연동
 # ==========================================
 
-# summary_data 항상 먼저 초기화 (어떤 버튼을 눌러도 안전)
+# ── 검색어 변경 감지 → 이전 결과 자동 초기화 ──
+_current_search_key = (search_name.strip(), search_idx.strip())
+if st.session_state.get('_last_search_key') != _current_search_key:
+    # 검색어가 바뀌었으면 summary_data 리셋
+    st.session_state['summary_data'] = {}
+    st.session_state['_last_search_key'] = _current_search_key
+
+# summary_data 기본값 보장
 if 'summary_data' not in st.session_state:
     st.session_state['summary_data'] = {}
 _sd_defaults = {
@@ -561,8 +674,9 @@ do_total_ob  = btn_all or btn_total_ob
 do_outbound  = btn_outbound or btn_all
 do_as        = btn_all or btn_as
 do_oos       = btn_all or btn_oos
+do_stock     = btn_stock  # 잔여재고 조회 전용
 
-if not any([do_inbound, do_total_ob, do_outbound, do_as, do_oos]):
+if not any([do_inbound, do_total_ob, do_outbound, do_as, do_oos, do_stock]):
     st.markdown('<div class="info-box">💡 상품명 또는 인덱스 번호 중 하나 이상 입력 후 조회하세요.<br>'
                 '📊 전체 출고량: 2018.05.09~현재 합산 (빠름) &nbsp;·&nbsp; 📤 기간별 출고: 드라이브 파일 조회</div>',
                 unsafe_allow_html=True)
@@ -856,7 +970,7 @@ if do_as:
     if df_as_old.attrs.get('error'):
         st.warning(f"AS 구 로드 실패: {df_as_old.attrs['error']}")
     with st.spinner("🔧 AS 신 시트 로딩 중 (2021~)..."):
-        df_as_new = load_sheet(URL_AS_NEW, tab_name="QUERY", col_range="A:G")
+        df_as_new = load_sheet(URL_AS_NEW, tab_name="QUERY_Copy", col_range="A:G")
     if df_as_new.attrs.get('error'):
         st.warning(f"AS 신 로드 실패: {df_as_new.attrs['error']}")
 
@@ -1238,64 +1352,249 @@ if do_oos:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ==========================================
-# 복붙용 요약 (입고+전체출고+AS+품절 모두 조회된 경우)
+# 잔여재고 조회 (⑦번 전용 - 모든 데이터 직접 수집)
 # ==========================================
-# 각 섹션 결과를 session_state에 저장해서 요약에 활용
-# (summary_data 초기화는 위에서 처리됨)
-
-# 요약 출력 조건: 입고 + 전체출고 + AS 가 모두 조회된 경우
-sd = st.session_state.get('summary_data', {})
-if sd.get('ready', False):
+if do_stock:
     st.markdown('<div class="result-box">', unsafe_allow_html=True)
-    st.markdown('<div class="result-title">📋 복붙용 요약</div>', unsafe_allow_html=True)
+    st.markdown('<div class="result-title">잔여재고 조회</div>', unsafe_allow_html=True)
 
-    prod_name = resolved_name or resolved_idx
-    today_str = date.today().strftime('%Y-%m-%d')
-    s_str = start_date.strftime('%Y-%m-%d')
-    e_str = end_date.strftime('%Y-%m-%d')
+    today_str_s = date.today().strftime('%Y-%m-%d')
+    prod_name_s = resolved_name or resolved_idx
 
-    inbound_total  = sd.get('inbound_total', 0)
-    ob_total       = sd.get('ob_total', 0)
-    as_old_t       = sd.get('as_old_total', 0)
-    as_new_t       = sd.get('as_new_total', 0)
-    expected       = inbound_total - ob_total - as_old_t - as_new_t
+    # ── 1) 입고 수집 ──
+    s_ib_total = 0
+    with st.spinner("입고 데이터 수집 중..."):
+        _df_ib = load_sheet(URL_INBOUND, tab_name="DB 컨테이너 입고리스트", header_row=3)
+    if not _df_ib.empty:
+        _c = _df_ib.columns.tolist()
+        _nc = next((c for c in _c if c == '상품'), None) or next((c for c in _c if '상품' in c and '코드' not in c), None)
+        _ic = next((c for c in _c if c == '인덱스번호' or '인덱스' in c), None)
+        _qc = next((c for c in _c if c == '수량'), None) or next((c for c in _c if '수량' in c and '단가' not in c), None)
+        _cc = next((c for c in _c if c == '상품코드'), None)
+        _hit = exact_match(_df_ib, _nc, _ic)
+        if _cc and not _hit.empty:
+            _hit = _hit[~_hit[_cc].astype(str).str.contains('샘플', na=False)]
+        if _qc and not _hit.empty:
+            s_ib_total = _hit[_qc].apply(safe_int).sum()
 
-    # 품절 후 값
-    restock_d      = sd.get('last_restock_date')
-    oos_d          = sd.get('last_oos_date')
-    ib_after       = sd.get('inbound_after_restock', 0)
-    ob_after       = sd.get('outbound_after_restock', 0)
-    as_old_after   = sd.get('as_after_oos_old', 0)
-    as_new_after   = sd.get('as_after_oos_new', 0)
-    cutoff_str     = str(restock_d or oos_d or '-')
-    oos_str        = str(oos_d or '-')
-    expected_after = ib_after - ob_after - as_old_after - as_new_after
+    # ── 2) 전체 출고 수집 ──
+    s_ob_total = 0
+    with st.spinner("전체 출고량 수집 중..."):
+        _df_tob = load_sheet(URL_TOTAL_OB, tab_index=0, header_row=2)
+    if not _df_tob.empty:
+        _tc = _df_tob.columns.tolist()
+        _t_ic = _tc[1] if len(_tc) > 1 else None
+        _t_nc = _tc[2] if len(_tc) > 2 else None
+        _t_sc = _tc[3] if len(_tc) > 3 else None
+        _t_hit = exact_match(_df_tob, _t_nc, _t_ic)
+        if _t_sc and not _t_hit.empty:
+            s_ob_total = _t_hit[_t_sc].apply(safe_int).sum()
 
-    tab_s1, tab_s2 = st.tabs(["📊 전체 입고수량 & 출고수량", "📊 최근 품절 후 입고수량 & 출고수량"])
+    # ── 3) 품절이력 수집 ──
+    s_oos_date = None
+    s_restock_date = None
+    with st.spinner("품절 이력 수집 중..."):
+        _df_oos = load_sheet(URL_OUTOFSTOCK, tab_name="QUERY연도별")
+    if not _df_oos.empty:
+        _oc = _df_oos.columns.tolist()
+        _o_ic = _oc[0] if _oc else None
+        _o_nc = _oc[4] if len(_oc) > 4 else None
+        _o_dc = _oc[6] if len(_oc) > 6 else None
+        _o_bc = _oc[8] if len(_oc) > 8 else None
+        _o_mask = pd.Series([False]*len(_df_oos), index=_df_oos.index)
+        if _o_nc:
+            for _nm in (matched_names or [resolved_name or resolved_idx]):
+                if _nm:
+                    _o_mask |= _df_oos[_o_nc].astype(str).str.lower().str.contains(_nm.lower(), na=False, regex=False)
+        if _o_ic and matched_index_nos:
+            _o_mask |= _df_oos[_o_ic].astype(str).str.strip().isin(matched_index_nos)
+        _df_oos_hit = _df_oos[_o_mask].copy()
+        if not _df_oos_hit.empty and _o_dc:
+            _df_oos_hit['_d'] = _df_oos_hit[_o_dc].apply(to_date)
+            _valid = _df_oos_hit[_df_oos_hit['_d'].notna()].sort_values('_d')
+            if not _valid.empty:
+                _latest = _valid.iloc[-1]
+                s_oos_date = _latest['_d']
+                if _o_bc:
+                    s_restock_date = to_date(_latest.get(_o_bc, ''))
+
+    # ── 4) AS 수집 ──
+    s_as_old_total = 0
+    s_as_new_total = 0
+    s_as_old_after = 0
+    s_as_new_after = 0
+    as_cutoff = s_restock_date or s_oos_date
+
+    with st.spinner("AS 구 수집 중..."):
+        _df_aso = load_sheet(URL_AS_OLD, tab_name="QUERY")
+    if not _df_aso.empty:
+        _ao_nc = _df_aso.columns.tolist()[4] if len(_df_aso.columns) > 4 else None
+        _ao_dc = _df_aso.columns.tolist()[1] if len(_df_aso.columns) > 1 else None
+        if _ao_nc:
+            _ao_mask = pd.Series([False]*len(_df_aso), index=_df_aso.index)
+            for _nm in (matched_names or [resolved_name or resolved_idx]):
+                if _nm:
+                    _ao_mask |= _df_aso[_ao_nc].astype(str).str.lower().str.contains(_nm.lower(), na=False, regex=False)
+            _df_aso_hit = _df_aso[_ao_mask].copy()
+            s_as_old_total = len(_df_aso_hit)
+            if as_cutoff and _ao_dc and not _df_aso_hit.empty:
+                _df_aso_hit['_d'] = _df_aso_hit[_ao_dc].apply(to_date)
+                s_as_old_after = len(_df_aso_hit[_df_aso_hit['_d'].notna() & (_df_aso_hit['_d'] >= as_cutoff)])
+
+    with st.spinner("AS 신 수집 중..."):
+        _df_asn = load_sheet(URL_AS_NEW, tab_name="QUERY_Copy", col_range="A:G")
+    if not _df_asn.empty:
+        _an_cols = _df_asn.columns.tolist()
+        _an_ic = _an_cols[2] if len(_an_cols) > 2 else None
+        _an_nc = _an_cols[4] if len(_an_cols) > 4 else None
+        _an_dc = _an_cols[1] if len(_an_cols) > 1 else None
+        _an_mask = pd.Series([False]*len(_df_asn), index=_df_asn.index)
+        if _an_ic and matched_index_nos:
+            _an_mask |= _df_asn[_an_ic].astype(str).str.strip().isin(matched_index_nos)
+        if _an_nc and not _an_mask.any():
+            for _nm in (matched_names or [resolved_name or resolved_idx]):
+                if _nm:
+                    _an_mask |= _df_asn[_an_nc].astype(str).str.lower().str.contains(_nm.lower(), na=False, regex=False)
+        _df_asn_hit = _df_asn[_an_mask].copy()
+        s_as_new_total = len(_df_asn_hit)
+        if as_cutoff and _an_dc and not _df_asn_hit.empty:
+            _df_asn_hit['_d'] = _df_asn_hit[_an_dc].apply(to_date)
+            s_as_new_after = len(_df_asn_hit[_df_asn_hit['_d'].notna() & (_df_asn_hit['_d'] >= as_cutoff)])
+
+    # ── 5) 품절 후 입고/출고 ──
+    s_ib_after = 0
+    s_ob_after = 0
+    ib_cutoff = s_oos_date  # 입고는 품절일 기준
+    if ib_cutoff and not _df_ib.empty and _nc and _qc:
+        _ib_hit2 = exact_match(_df_ib, _nc, _ic)
+        if _cc and not _ib_hit2.empty:
+            _ib_hit2 = _ib_hit2[~_ib_hit2[_cc].astype(str).str.contains('샘플', na=False)]
+        _dc2 = next((c for c in _df_ib.columns if c == '창고입고일' or '입고일' in c or '입항일' in c), None)
+        if _dc2 and not _ib_hit2.empty:
+            _ib_hit2['_d'] = _ib_hit2[_dc2].apply(to_date)
+            _ib_after_df = _ib_hit2[_ib_hit2['_d'].notna() & (_ib_hit2['_d'] >= ib_cutoff)]
+            s_ib_after = _ib_after_df[_qc].apply(safe_int).sum()
+
+    if ib_cutoff:
+        _start_ym2 = ib_cutoff.year * 100 + ib_cutoff.month
+        _end_ym2 = date.today().year * 100 + date.today().month
+        with st.spinner("품절 후 출고 데이터 수집 중..."):
+            _df_ob_a = load_outbound_for_period(FOLDER_OUTBOUND_ID, _start_ym2, _end_ym2)
+        if not _df_ob_a.empty:
+            _ob_nc2 = '제품명' if '제품명' in _df_ob_a.columns else None
+            _ob_ic2 = '코드'   if '코드'   in _df_ob_a.columns else None
+            _ob_dc2 = '날짜'   if '날짜'   in _df_ob_a.columns else None
+            _ob_qc2 = '출고량' if '출고량' in _df_ob_a.columns else None
+            if _ob_dc2:
+                _df_ob_a['_d'] = _df_ob_a[_ob_dc2].apply(to_date)
+                _df_ob_a = _df_ob_a[_df_ob_a['_d'].notna() & (_df_ob_a['_d'] >= ib_cutoff)]
+            _ob_hit2 = exact_match(_df_ob_a, _ob_nc2, _ob_ic2)
+            if _ob_qc2 and not _ob_hit2.empty:
+                s_ob_after = _ob_hit2[_ob_qc2].apply(safe_int).sum()
+
+    # ── 계산 ──
+    s_expected       = s_ib_total - s_ob_total - s_as_old_total - s_as_new_total
+    s_expected_after = s_ib_after - s_ob_after - s_as_old_after - s_as_new_after
+    oos_str_s    = str(s_oos_date     or '-')
+    restock_str_s = str(s_restock_date or '-')
+    cutoff_str_s  = str(as_cutoff or '-')
+
+    # ── 대시보드 카드 ──
+    st.markdown(f"<div style='font-size:0.9rem;font-weight:600;color:#c0d0e8;margin-bottom:0.8rem;'>{prod_name_s}</div>", unsafe_allow_html=True)
+
+    r1c1, r1c2, r1c3 = st.columns(3)
+    with r1c1:
+        st.markdown(f"""<div class="kpi-card kpi-inbound">
+            <div class="kpi-label">총 입고수량</div>
+            <div class="kpi-value">{s_ib_total:,}</div>
+            <div class="kpi-sub">전체 기간</div></div>""", unsafe_allow_html=True)
+    with r1c2:
+        st.markdown(f"""<div class="kpi-card kpi-outbound">
+            <div class="kpi-label">전체 출고량</div>
+            <div class="kpi-value">{s_ob_total:,}</div>
+            <div class="kpi-sub">2018.05.09 ~ 현재</div></div>""", unsafe_allow_html=True)
+    with r1c3:
+        exp_color = "#66BB6A" if s_expected >= 0 else "#FF7043"
+        st.markdown(f"""<div class="kpi-card" style="border-color:#2a3a5c;">
+            <div class="kpi-label">예상 잔여재고</div>
+            <div class="kpi-value" style="color:{exp_color};">{s_expected:,}</div>
+            <div class="kpi-sub">입고 - 출고 - AS({s_as_old_total+s_as_new_total})</div></div>""", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+
+    # 품절 정보
+    if s_oos_date:
+        r2c1, r2c2, r2c3 = st.columns(3)
+        with r2c1:
+            st.markdown(f"""<div class="kpi-card kpi-inbound">
+                <div class="kpi-label">품절후 입고 ({oos_str_s} 이후)</div>
+                <div class="kpi-value">{s_ib_after:,}</div>
+                <div class="kpi-sub">재입고일: {restock_str_s}</div></div>""", unsafe_allow_html=True)
+        with r2c2:
+            st.markdown(f"""<div class="kpi-card kpi-outbound">
+                <div class="kpi-label">품절후 출고 ({oos_str_s}~)</div>
+                <div class="kpi-value">{s_ob_after:,}</div>
+                <div class="kpi-sub">~ {today_str_s}</div></div>""", unsafe_allow_html=True)
+        with r2c3:
+            exp2_color = "#66BB6A" if s_expected_after >= 0 else "#FF7043"
+            st.markdown(f"""<div class="kpi-card" style="border-color:#2a3a5c;">
+                <div class="kpi-label">품절후 잔여재고</div>
+                <div class="kpi-value" style="color:{exp2_color};">{s_expected_after:,}</div>
+                <div class="kpi-sub">AS({s_as_old_after+s_as_new_after}) 포함</div></div>""", unsafe_allow_html=True)
+
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+        st.markdown(f"""<div class="info-box">
+            최근 품절일: <strong>{oos_str_s}</strong> &nbsp;·&nbsp;
+            재입고일: <strong>{restock_str_s}</strong> &nbsp;·&nbsp;
+            AS 구(전체 {s_as_old_total} / 재입고후 {s_as_old_after}) &nbsp;·&nbsp;
+            AS 신(전체 {s_as_new_total} / 재입고후 {s_as_new_after})
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="info-box">품절 이력 없음</div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── 복붙용 텍스트 ──
+    tab_s1, tab_s2 = st.tabs(["전체 입고수량 & 출고수량", "최근 품절 후 입고수량 & 출고수량"])
 
     with tab_s1:
         summary1 = f"""전체 입고수량 & 출고수량
-{prod_name}
-1 총 입고수량 {inbound_total:,}개
-2 전체 출고량 [2018.05.09~{today_str}] {ob_total:,}개
-3 AS 출고건수 (AS Report 2015.11.11~2021.03.30) {as_old_t:,}개
-4 AS 출고건수 (AS Report 2021.05.21~현재) {as_new_t:,}개
-5 예상재고 {expected:,}개"""
-        st.text_area("복사 후 붙여넣기", value=summary1, height=180, key="summary_text1")
+{prod_name_s}
+1 총 입고수량 {s_ib_total:,}개
+2 전체 출고량 [2018.05.09~{today_str_s}] {s_ob_total:,}개
+3 AS 출고건수 (AS Report 2015.11.11~2021.03.30) {s_as_old_total:,}개
+4 AS 출고건수 (AS Report 2021.05.21~현재) {s_as_new_total:,}개
+5 예상재고 {s_expected:,}개"""
+        st.text_area("복사하세요", value=summary1, height=170, key=f"s_text1_{prod_name_s[:20]}")
+        st.components.v1.html(f"""
+        <button onclick="navigator.clipboard.writeText(`{summary1.replace('`', chr(96))}`).then(()=>{{
+            this.textContent='복사됨!'; this.style.background='#2e7d32';
+            setTimeout(()=>{{this.textContent='복사'; this.style.background='#1a3a5c';}},2000);
+        }})"
+        style="padding:6px 24px;background:#1a3a5c;color:#c0d0e8;border:none;border-radius:6px;
+               cursor:pointer;font-size:13px;font-weight:600;">복사</button>
+        """, height=40)
 
     with tab_s2:
-        if restock_d or oos_d:
+        if s_oos_date:
             summary2 = f"""최근 품절 후 입고수량 & 출고수량
-{prod_name}
-1 품절후 입고수량 ({oos_str} 이후) {ib_after:,}개
-2 품절 후 출고량 [{oos_str}~{today_str}] {ob_after:,}개
-3 AS 출고건수 (AS Report 2015.11.11~2021.03.30) {as_old_after:,}개
-4 AS 출고건수 (최근 품절 재입고 이후)[{cutoff_str}~현재] {as_new_after:,}개
-5 예상재고 {expected_after:,}개"""
-            st.text_area("복사 후 붙여넣기", value=summary2, height=180, key="summary_text2")
+{prod_name_s}
+1 품절후 입고수량 ({oos_str_s} 이후) {s_ib_after:,}개
+2 품절 후 출고량 [{oos_str_s}~{today_str_s}] {s_ob_after:,}개
+3 AS 출고건수 (AS Report 2015.11.11~2021.03.30) {s_as_old_after:,}개
+4 AS 출고건수 (최근 품절 재입고 이후)[{cutoff_str_s}~현재] {s_as_new_after:,}개
+5 예상재고 {s_expected_after:,}개"""
+            st.text_area("복사하세요", value=summary2, height=170, key=f"s_text2_{prod_name_s[:20]}")
+            st.components.v1.html(f"""
+            <button onclick="navigator.clipboard.writeText(`{summary2.replace('`', chr(96))}`).then(()=>{{
+                this.textContent='복사됨!'; this.style.background='#2e7d32';
+                setTimeout(()=>{{this.textContent='복사'; this.style.background='#1a3a5c';}},2000);
+            }})"
+            style="padding:6px 24px;background:#1a3a5c;color:#c0d0e8;border:none;border-radius:6px;
+                   cursor:pointer;font-size:13px;font-weight:600;">복사</button>
+            """, height=40)
         else:
-            st.markdown('<div class="info-box">ℹ️ 품절 이력이 없어 최근 품절 후 요약을 표시할 수 없습니다.</div>',
-                        unsafe_allow_html=True)
+            st.markdown('<div class="info-box">품절 이력이 없어 최근 품절 후 요약을 표시할 수 없습니다.</div>', unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
 
